@@ -1,11 +1,14 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
+import { mkdir, mkdtemp, rename, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import type { Tool as McpTool } from "@modelcontextprotocol/sdk/types.js";
 import {
   DEFAULT_MAX_BYTES,
   DEFAULT_MAX_LINES,
@@ -39,6 +42,98 @@ const DISCOVERABLE_TOOLS_FLAG = "ida-tools-discoverable";
 type PiContent =
   | { type: "text"; text: string }
   | { type: "image"; data: string; mimeType: string };
+
+interface McpServer {
+  client: Client;
+  tools: McpTool[];
+}
+
+/** Mirrors `get_mcp_state_dir()` in ida_mcp/paths.py. */
+function mcpStateDir(): string {
+  const expandHome = (path: string) =>
+    path.replace(/^~(?=$|[\\/])/, homedir());
+  if (process.env.IDA_MCP_STATE_DIR)
+    return expandHome(process.env.IDA_MCP_STATE_DIR);
+  const idausr = process.env.IDAUSR?.split(delimiter)[0]?.trim();
+  if (idausr) return join(expandHome(idausr), "mcp");
+  return process.platform === "win32"
+    ? join(process.env.APPDATA ?? homedir(), "Hex-Rays", "IDA Pro", "mcp")
+    : join(homedir(), ".idapro", "mcp");
+}
+
+// Sessions register tools from this cache and start the server only when a
+// tool is called. Each checkout has its own file, keyed by a hash of the files
+// the server builds its tool list from, so editing them without a version bump
+// still invalidates it. Every server start rewrites it.
+function toolCache(): { path: string; key: string } {
+  const sources = [
+    ...readdirSync(join(PACKAGE_ROOT, "ida_mcp"))
+      .filter((name) => name.endsWith(".py"))
+      .sort()
+      .map((name) => join("ida_mcp", name)),
+    "pyproject.toml",
+    "uv.lock",
+  ];
+  const key = createHash("sha256");
+  for (const source of sources) {
+    const contents = readFileSync(join(PACKAGE_ROOT, source));
+    key.update(`${source}\0${contents.length}\0`).update(contents);
+  }
+  const root = createHash("sha256").update(PACKAGE_ROOT).digest("hex");
+  return {
+    path: join(mcpStateDir(), "extension-tools", `${root.slice(0, 16)}.json`),
+    key: key.digest("hex"),
+  };
+}
+
+// Registration needs a name and an input schema; anything else is a miss.
+function isCachedTool(value: unknown): value is McpTool {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "name" in value &&
+    typeof value.name === "string" &&
+    "inputSchema" in value &&
+    typeof value.inputSchema === "object" &&
+    value.inputSchema !== null
+  );
+}
+
+// Read synchronously so a cache miss starts discovery within session_start.
+function readToolCache(): McpTool[] | undefined {
+  try {
+    const { path, key } = toolCache();
+    const cache: unknown = JSON.parse(readFileSync(path, "utf8"));
+    if (
+      typeof cache !== "object" ||
+      cache === null ||
+      !("key" in cache) ||
+      cache.key !== key ||
+      !("tools" in cache)
+    )
+      return undefined;
+    const { tools } = cache;
+    return Array.isArray(tools) &&
+      tools.length > 0 &&
+      tools.every(isCachedTool)
+      ? tools
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeToolCache(tools: McpTool[]): Promise<void> {
+  try {
+    const { path, key } = toolCache();
+    const temporaryPath = `${path}.${randomUUID()}.tmp`;
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(temporaryPath, JSON.stringify({ key, tools }), "utf8");
+    await rename(temporaryPath, path);
+  } catch {
+    // Without a cache, the next session discovers tools at startup again.
+  }
+}
 
 async function saveStartupLog(output: string): Promise<string | undefined> {
   if (!output.trim()) return undefined;
@@ -131,6 +226,7 @@ export default function idaMcp(pi: ExtensionAPI) {
   const sessionPathField = `${agentKind}_session_path`;
   let client: Client | undefined;
   let connectingClient: Client | undefined;
+  let connection: Promise<McpServer> | undefined;
   let startupPromise: Promise<void> | undefined;
   let pendingOmpToolRegistration: (() => void) | undefined;
   let sessionRunning = false;
@@ -245,9 +341,8 @@ export default function idaMcp(pi: ExtensionAPI) {
     }
   };
 
-  const startMcp = async (ctx: ExtensionContext): Promise<void> => {
-    if (client || connectingClient) return;
-
+  const startMcp = async (ctx: ExtensionContext): Promise<McpServer> => {
+    showStatus(ctx, "starting");
     const next = new Client({ name: "ida", version: PACKAGE_VERSION });
     connectingClient = next;
     let capturedStderr = "";
@@ -285,15 +380,70 @@ export default function idaMcp(pi: ExtensionAPI) {
       capturedStderr = (capturedStderr + text).slice(-STDERR_CAPTURE_MAX_CHARS);
     });
 
+    let tools: McpTool[];
     try {
       await next.connect(transport);
-      const { tools } = await next.listTools();
-      if (!sessionRunning || connectingClient !== next) {
-        await next.close().catch(() => undefined);
-        return;
-      }
-      client = next;
-      connectingClient = undefined;
+      ({ tools } = await next.listTools());
+    } catch (error) {
+      if (connectingClient === next) connectingClient = undefined;
+      await next.close().catch(() => undefined);
+      if (!sessionRunning) throw error;
+
+      const message = error instanceof Error ? error.message : String(error);
+      const logContents = capturedStderr
+        ? `Hex-Rays IDA MCP failed to start: ${message}\n\n${capturedStderr}`
+        : `Hex-Rays IDA MCP failed to start: ${message}\n`;
+      const logPath = await saveStartupLog(logContents);
+      const details = [message, ...(logPath ? [`Log: ${logPath}`] : [])];
+      showStatus(ctx, "error", details);
+      throw new Error(
+        `Hex-Rays IDA MCP failed to start: ${details.join("\n")}`,
+      );
+    }
+    if (!sessionRunning || connectingClient !== next) {
+      await next.close().catch(() => undefined);
+      throw new Error("The Hex-Rays IDA MCP session ended during startup");
+    }
+    client = next;
+    connectingClient = undefined;
+    captureStderr = false;
+    capturedStderr = "";
+    await writeToolCache(tools);
+    showStatus(ctx, "ready");
+    return { client: next, tools };
+  };
+
+  // Tools start the server on first use; a failed start is retried next call.
+  const connectMcp = (ctx: ExtensionContext): Promise<McpServer> => {
+    if (!sessionRunning) {
+      return Promise.reject(
+        new Error("The Hex-Rays IDA MCP session has ended"),
+      );
+    }
+    if (!connection) {
+      const pending = startMcp(ctx);
+      connection = pending;
+      pending.catch(() => {
+        if (connection === pending) connection = undefined;
+      });
+    }
+    return connection;
+  };
+
+  const registerSessionTools = async (ctx: ExtensionContext): Promise<void> => {
+    // A cache miss starts the server once to discover the tools.
+    const tools =
+      readToolCache() ??
+      (await connectMcp(ctx).then(
+        (server) => server.tools,
+        () => undefined,
+      ));
+    if (!tools) {
+      // Discovery failed; the next input or agent start retries it.
+      if (sessionRunning) startupPromise = undefined;
+      return;
+    }
+    if (sessionRunning) {
       const ompToolOptions =
         agentKind === "omp"
           ? {
@@ -330,8 +480,7 @@ export default function idaMcp(pi: ExtensionAPI) {
               );
             },
             async execute(_id, params, signal, onUpdate, ctx) {
-              if (!client)
-                throw new Error("The Hex-Rays IDA MCP server is not connected");
+              const server = await connectMcp(ctx);
 
               const sessionPath = ctx.sessionManager.getSessionFile();
               const args = params as Record<string, unknown>;
@@ -346,7 +495,7 @@ export default function idaMcp(pi: ExtensionAPI) {
                 !path.startsWith("~")
                   ? { ...args, path: resolve(ctx.cwd, path) }
                   : args;
-              const result = await client.callTool(
+              const result = await server.client.callTool(
                 {
                   name: tool.name,
                   arguments: forwardedArgs,
@@ -437,27 +586,13 @@ export default function idaMcp(pi: ExtensionAPI) {
 
       if (agentKind === "omp") pendingOmpToolRegistration = registerTools;
       else registerTools();
-
-      captureStderr = false;
-      capturedStderr = "";
-      showStatus(ctx, "ready");
-    } catch (error) {
-      if (connectingClient === next) connectingClient = undefined;
-      if (client === next) client = undefined;
-      await next.close().catch(() => undefined);
-      if (!sessionRunning) return;
-
-      const message = error instanceof Error ? error.message : String(error);
-      const logContents = capturedStderr
-        ? `Hex-Rays IDA MCP failed to start: ${message}\n\n${capturedStderr}`
-        : `Hex-Rays IDA MCP failed to start: ${message}\n`;
-      const logPath = await saveStartupLog(logContents);
-      const details = [message, ...(logPath ? [`Log: ${logPath}`] : [])];
-      showStatus(ctx, "error", details);
     }
   };
 
-  const ensureOmpToolsRegistered = async (): Promise<void> => {
+  const ensureToolsRegistered = async (
+    ctx: ExtensionContext,
+  ): Promise<void> => {
+    if (sessionRunning) startupPromise ??= registerSessionTools(ctx);
     await startupPromise;
     const registerTools = pendingOmpToolRegistration;
     pendingOmpToolRegistration = undefined;
@@ -467,18 +602,16 @@ export default function idaMcp(pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     if (startupPromise) return;
     sessionRunning = true;
-    showStatus(ctx, "starting");
-    startupPromise = startMcp(ctx);
+    startupPromise = registerSessionTools(ctx);
   });
 
-  pi.on("input", async () => {
-    if (agentKind === "omp") await ensureOmpToolsRegistered();
-    else await startupPromise;
+  pi.on("input", async (_event, ctx) => {
+    await ensureToolsRegistered(ctx);
     return { action: "continue" };
   });
 
-  pi.on("before_agent_start", async () => {
-    if (agentKind === "omp") await ensureOmpToolsRegistered();
+  pi.on("before_agent_start", async (_event, ctx) => {
+    if (agentKind === "omp") await ensureToolsRegistered(ctx);
   });
 
 	pi.on("session_shutdown", async (_event, ctx) => {
@@ -488,6 +621,7 @@ export default function idaMcp(pi: ExtensionAPI) {
 		const connecting = connectingClient;
 		client = undefined;
 		connectingClient = undefined;
+		connection = undefined;
 		startupPromise = undefined;
 		pendingOmpToolRegistration = undefined;
 		// The host caps shutdown handlers at 2s; a stuck MCP pipe must not

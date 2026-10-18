@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
-import { resolve } from "node:path";
-import test from "node:test";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import test, { type TestContext } from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -18,7 +20,21 @@ function requireHandler(
   return handler;
 }
 
+// The extension caches the MCP tool list in its state directory.
+async function useStateDir(t: TestContext): Promise<string> {
+  const previous = process.env.IDA_MCP_STATE_DIR;
+  const stateDir = await mkdtemp(join(tmpdir(), "ida-mcp-test-"));
+  process.env.IDA_MCP_STATE_DIR = stateDir;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.IDA_MCP_STATE_DIR;
+    else process.env.IDA_MCP_STATE_DIR = previous;
+    await rm(stateDir, { recursive: true, force: true });
+  });
+  return stateDir;
+}
+
 test("OMP waits for MCP tool registration at the first agent start", async (t) => {
+  await useStateDir(t);
   const originalConnect = Reflect.get(Client.prototype, "connect");
   const originalListTools = Reflect.get(Client.prototype, "listTools");
   const originalClose = Reflect.get(Client.prototype, "close");
@@ -128,6 +144,7 @@ test("OMP waits for MCP tool registration at the first agent start", async (t) =
 });
 
 test("open_database resolves paths from the agent workspace", async (t) => {
+  await useStateDir(t);
   const originalConnect = Reflect.get(Client.prototype, "connect");
   const originalListTools = Reflect.get(Client.prototype, "listTools");
   const originalCallTool = Reflect.get(Client.prototype, "callTool");
@@ -202,4 +219,289 @@ test("open_database resolves paths from the agent workspace", async (t) => {
   ]);
   assert.deepEqual(relativeArgs, { path: "tests/crackme03.elf" });
   await requireHandler(handlers, "session_shutdown")({}, ctx);
+});
+
+function mockClient(
+  t: TestContext,
+  methods: Record<string, (...args: never[]) => Promise<unknown>>,
+) {
+  for (const [name, method] of Object.entries(methods)) {
+    const original = Reflect.get(Client.prototype, name);
+    Reflect.set(Client.prototype, name, method);
+    t.after(() => Reflect.set(Client.prototype, name, original));
+  }
+}
+
+interface FakeTool {
+  name: string;
+  execute: (...args: unknown[]) => Promise<unknown>;
+}
+
+interface StatusEvent {
+  type: string;
+  serverName?: string;
+  error?: string;
+}
+
+function ompSession(sessionFile: string) {
+  const handlers = new Map<string, Handler>();
+  const tools = new Map<string, FakeTool>();
+  const statusEvents: StatusEvent[] = [];
+  const pi = {
+    arktype: {},
+    zod: {},
+    events: {
+      emit(_channel: string, data: StatusEvent) {
+        statusEvents.push(data);
+      },
+    },
+    registerFlag() {},
+    getFlag() {
+      return false;
+    },
+    on(event: string, handler: Handler) {
+      handlers.set(event, handler);
+    },
+    registerTool(tool: FakeTool) {
+      tools.set(tool.name, tool);
+    },
+  } as unknown as ExtensionAPI;
+  const ctx = {
+    cwd: resolve("agent-workspace"),
+    ui: { setWidget() {} },
+    sessionManager: { getSessionFile: () => sessionFile },
+  };
+  idaMcp(pi);
+  return {
+    tools,
+    statusEvents,
+    emit: (event: string) => requireHandler(handlers, event)({}, ctx),
+    call(name: string) {
+      const tool = tools.get(name);
+      assert.ok(tool, `missing ${name} tool`);
+      return tool.execute("call", {}, undefined, undefined, ctx);
+    },
+  };
+}
+
+// A fake MCP server; `failures` connects fail before one succeeds, and `gate`
+// holds connects until it resolves.
+function fakeMcp(t: TestContext) {
+  const mcp = {
+    connects: 0,
+    closes: 0,
+    calls: [] as unknown[],
+    failures: 0,
+    gate: undefined as Promise<void> | undefined,
+  };
+  mockClient(t, {
+    connect: async () => {
+      mcp.connects++;
+      await mcp.gate;
+      if (mcp.failures > 0) {
+        mcp.failures--;
+        throw new Error("spawn uv ENOENT");
+      }
+    },
+    listTools: async () => ({
+      tools: [{ name: "list_databases", inputSchema: { type: "object" } }],
+    }),
+    callTool: async (request: never) => {
+      mcp.calls.push(request);
+      return { content: [{ type: "text", text: "[]" }] };
+    },
+    close: async () => {
+      mcp.closes++;
+    },
+  });
+  return mcp;
+}
+
+function gate() {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
+const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+// Runs one session on an empty cache so it discovers and caches the tools.
+async function populateToolCache(stateDir: string): Promise<string> {
+  const session = ompSession("/sessions/discovery.jsonl");
+  await session.emit("session_start");
+  await session.emit("before_agent_start");
+  await session.emit("session_shutdown");
+  const [file] = await readdir(join(stateDir, "extension-tools"));
+  assert.ok(file, "discovery must write the tool cache");
+  return join(stateDir, "extension-tools", file);
+}
+
+test("OMP registers cached tools and starts MCP on the first call", async (t) => {
+  const stateDir = await useStateDir(t);
+  const mcp = fakeMcp(t);
+
+  // A cache miss discovers the tools at startup and caches them.
+  const cachePath = await populateToolCache(stateDir);
+  assert.equal(mcp.connects, 1);
+  assert.equal(mcp.closes, 1);
+  const cache = JSON.parse(await readFile(cachePath, "utf8")) as {
+    tools: { name: string }[];
+  };
+  assert.deepEqual(
+    cache.tools.map((tool) => tool.name),
+    ["list_databases"],
+  );
+
+  // With the cache, tools are registered before MCP starts.
+  const session = ompSession("/sessions/second.jsonl");
+  await session.emit("session_start");
+  await session.emit("before_agent_start");
+  assert.deepEqual([...session.tools.keys()], ["ida_list_databases"]);
+  assert.equal(mcp.connects, 1, "a cached session must not start MCP");
+  assert.deepEqual(session.statusEvents, []);
+
+  await session.call("ida_list_databases");
+  await session.call("ida_list_databases");
+  assert.equal(mcp.connects, 2, "calls share the session's MCP server");
+  assert.deepEqual(mcp.calls, [
+    {
+      name: "list_databases",
+      arguments: {},
+      _meta: { omp_session_path: "/sessions/second.jsonl" },
+    },
+    {
+      name: "list_databases",
+      arguments: {},
+      _meta: { omp_session_path: "/sessions/second.jsonl" },
+    },
+  ]);
+  assert.deepEqual(session.statusEvents, [
+    { type: "connecting", serverNames: ["ida"] },
+    { type: "connected", serverName: "ida" },
+  ]);
+  await session.emit("session_shutdown");
+  assert.equal(mcp.closes, 2);
+});
+
+test("concurrent first calls start one MCP server", async (t) => {
+  const stateDir = await useStateDir(t);
+  const mcp = fakeMcp(t);
+  await populateToolCache(stateDir);
+  const session = ompSession("/sessions/concurrent.jsonl");
+  await session.emit("session_start");
+  await session.emit("before_agent_start");
+
+  const start = gate();
+  mcp.gate = start.promise;
+  const calls = Promise.all([
+    session.call("ida_list_databases"),
+    session.call("ida_list_databases"),
+  ]);
+  await tick();
+  start.release();
+  await calls;
+  assert.equal(mcp.connects, 2, "one discovery start plus one lazy start");
+  assert.equal(mcp.calls.length, 2);
+  await session.emit("session_shutdown");
+});
+
+test("shutdown during a lazy start closes the MCP child", async (t) => {
+  const stateDir = await useStateDir(t);
+  const mcp = fakeMcp(t);
+  await populateToolCache(stateDir);
+  const session = ompSession("/sessions/shutdown.jsonl");
+  await session.emit("session_start");
+  await session.emit("before_agent_start");
+
+  const start = gate();
+  mcp.gate = start.promise;
+  const call = session.call("ida_list_databases");
+  await tick();
+  const closesBefore = mcp.closes;
+  await session.emit("session_shutdown");
+  assert.equal(mcp.closes, closesBefore + 1, "shutdown closes the child");
+  start.release();
+  await assert.rejects(call, /session ended during startup/);
+  assert.equal(session.statusEvents.at(-1)?.type, "connecting");
+
+  await assert.rejects(
+    session.call("ida_list_databases"),
+    /session has ended/,
+  );
+  assert.equal(mcp.connects, 2, "an ended session must not start MCP");
+});
+
+test("a failed tool discovery is retried at the next agent start", async (t) => {
+  await useStateDir(t);
+  const mcp = fakeMcp(t);
+  mcp.failures = 1;
+  const session = ompSession("/sessions/discovery-retry.jsonl");
+  await session.emit("session_start");
+  await session.emit("before_agent_start");
+  assert.deepEqual([...session.tools.keys()], []);
+  assert.equal(session.statusEvents.at(-1)?.type, "failed");
+
+  await session.emit("before_agent_start");
+  assert.deepEqual([...session.tools.keys()], ["ida_list_databases"]);
+  assert.equal(mcp.connects, 2);
+  assert.equal(session.statusEvents.at(-1)?.type, "connected");
+  await session.emit("session_shutdown");
+});
+
+test("a lazy startup failure is reported by the tool call", async (t) => {
+  const stateDir = await useStateDir(t);
+  const mcp = fakeMcp(t);
+  await populateToolCache(stateDir);
+  mcp.failures = 2;
+
+  const session = ompSession("/sessions/failing.jsonl");
+  await session.emit("session_start");
+  await session.emit("before_agent_start");
+  assert.equal(mcp.connects, 1);
+
+  await assert.rejects(
+    session.call("ida_list_databases"),
+    /failed to start: spawn uv ENOENT\nLog: .*stderr\.log/,
+  );
+  const failure = session.statusEvents.at(-1);
+  assert.equal(failure?.type, "failed");
+  assert.equal(failure?.serverName, "ida");
+  assert.match(
+    failure?.error ?? "",
+    /^spawn uv ENOENT — Log: .*stderr\.log$/,
+  );
+
+  await assert.rejects(session.call("ida_list_databases"), /spawn uv ENOENT/);
+  assert.equal(mcp.connects, 3, "the next call retries startup");
+  await session.emit("session_shutdown");
+});
+
+test("empty, malformed, and stale tool caches are misses", async (t) => {
+  const stateDir = await useStateDir(t);
+  const mcp = fakeMcp(t);
+  const cachePath = await populateToolCache(stateDir);
+  const { key, tools } = JSON.parse(await readFile(cachePath, "utf8")) as {
+    key: string;
+    tools: unknown[];
+  };
+
+  const invalidCaches = [
+    JSON.stringify({ key, tools: [] }),
+    JSON.stringify({ key, tools: [null] }),
+    JSON.stringify({ key, tools: [{ name: "list_databases" }] }),
+    JSON.stringify({ key: "stale", tools }),
+    "{",
+  ];
+  for (const contents of invalidCaches) {
+    await writeFile(cachePath, contents);
+    const connectsBefore = mcp.connects;
+    const session = ompSession("/sessions/invalid-cache.jsonl");
+    await session.emit("session_start");
+    await session.emit("before_agent_start");
+    assert.deepEqual([...session.tools.keys()], ["ida_list_databases"]);
+    assert.equal(mcp.connects, connectsBefore + 1, contents);
+    await session.emit("session_shutdown");
+  }
 });

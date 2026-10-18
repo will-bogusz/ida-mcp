@@ -60,6 +60,17 @@ Stdio EOF, SIGINT, SIGTERM, normal interpreter exit, and explicit HTTP shutdown
 release the process's handles. Nexus performs final managed-worker save and
 shutdown when the last lease disappears.
 
+## Pi/OMP lifecycle
+
+The extension registers its tools from a cached tool list and starts its stdio
+MCP child on the first tool call, so sessions (including OMP subagents) that
+never call a tool start no process. Each checkout caches under
+`<IDA_MCP_STATE_DIR>/extension-tools/`, keyed by a hash of `ida_mcp/*.py`,
+`pyproject.toml`, and `uv.lock`. A missing, invalid, or stale cache starts the
+child at session start to discover the tools, retrying at the next prompt if
+that fails; every start rewrites the cache. Each session still owns its own
+child, so the current database and leases remain per session.
+
 ## Semantic tracing
 
 One schema-1 JSONL trace is created lazily on the first tool call. Lifecycle-only
