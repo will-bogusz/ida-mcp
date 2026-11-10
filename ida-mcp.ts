@@ -37,7 +37,7 @@ const STATUS_HIDE_DELAY_MS = 4000;
 // renders it as one combined status line; the widget is only for Pi.
 const OMP_MCP_STATUS_CHANNEL = "mcp:connection-status";
 const OMP_MCP_SERVER_NAME = "ida";
-const DISCOVERABLE_TOOLS_FLAG = "ida-tools-discoverable";
+const ESSENTIAL_TOOLS_FLAG = "ida-tools-essential";
 
 type PiContent =
   | { type: "text"; text: string }
@@ -215,9 +215,9 @@ export default function idaMcp(pi: ExtensionAPI) {
   const agentKind = "arktype" in pi && "zod" in pi ? "omp" : "pi";
   if (agentKind === "omp") {
     void disableOmpBuiltinIda(pi);
-    pi.registerFlag(DISCOVERABLE_TOOLS_FLAG, {
+    pi.registerFlag(ESSENTIAL_TOOLS_FLAG, {
       description:
-        "Mount IDA tools under xd:// instead of exposing them directly in OMP",
+        "Expose IDA tools directly in OMP instead of mounting them under xd://",
       type: "boolean",
       default: false,
     });
@@ -448,9 +448,9 @@ export default function idaMcp(pi: ExtensionAPI) {
         agentKind === "omp"
           ? {
               loadMode:
-                pi.getFlag(DISCOVERABLE_TOOLS_FLAG) === true
-                  ? ("discoverable" as const)
-                  : ("essential" as const),
+                pi.getFlag(ESSENTIAL_TOOLS_FLAG) === true
+                  ? ("essential" as const)
+                  : ("discoverable" as const),
             }
           : {};
       const registerTools = () => {

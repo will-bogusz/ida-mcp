@@ -67,6 +67,7 @@ test("OMP waits for MCP tool registration at the first agent start", async (t) =
 
   const handlers = new Map<string, Handler>();
   const registeredTools: string[] = [];
+  const registeredLoadModes: unknown[] = [];
   const statusEvents: { channel: string; data: unknown }[] = [];
   let widgetCalls = 0;
   const pi = {
@@ -92,6 +93,7 @@ test("OMP waits for MCP tool registration at the first agent start", async (t) =
         typeof tool.name === "string"
       ) {
         registeredTools.push(tool.name);
+        registeredLoadModes.push(Reflect.get(tool, "loadMode"));
       }
     },
   } as unknown as ExtensionAPI;
@@ -128,6 +130,7 @@ test("OMP waits for MCP tool registration at the first agent start", async (t) =
   releaseToolDiscovery?.();
   await agentStart;
   assert.deepEqual(registeredTools, ["ida_execute_python"]);
+  assert.deepEqual(registeredLoadModes, ["discoverable"]);
 
   await requireHandler(handlers, "session_shutdown")({}, ctx);
   assert.equal(widgetCalls, 0, "OMP must not draw the Pi status widget");
