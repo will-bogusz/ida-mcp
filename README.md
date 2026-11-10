@@ -96,6 +96,12 @@ omp plugin install github:HexRaysSA/ida-mcp#latest
 omp plugin upgrade
 ```
 
+OMP mounts IDA tools under `xd://` by default: read a device such as
+`xd://ida_list_databases` for its schema, then write JSON arguments there to
+call it. The MCP server starts on the first IDA call, not during discovery.
+Use `omp --ida-tools-essential` to expose all six tools directly for a session.
+Restart existing sessions to pick up an updated extension.
+
 #### Other agents
 
 Configure a regular stdio MCP server in your MCP JSON configuration:

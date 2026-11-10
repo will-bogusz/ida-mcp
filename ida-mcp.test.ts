@@ -15,7 +15,7 @@ type Tool = {
   execute: (...args: unknown[]) => Promise<unknown>;
 };
 
-function createHost(kind: "pi" | "omp" = "pi", discoverable = false) {
+function createHost(kind: "pi" | "omp" = "pi", essential = false) {
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, Tool>();
   const status: { type: string; error?: string }[] = [];
@@ -29,7 +29,7 @@ function createHost(kind: "pi" | "omp" = "pi", discoverable = false) {
     },
     registerFlag() {},
     getFlag() {
-      return discoverable;
+      return essential;
     },
     on(event: string, handler: Handler) {
       handlers.set(event, handler);
@@ -94,12 +94,12 @@ function deferred() {
   return { promise, resolve };
 }
 
-for (const [kind, discoverable] of [
+for (const [kind, essential] of [
   ["pi", false],
   ["omp", false],
   ["omp", true],
 ] as const) {
-  test(`${kind}${discoverable ? " discoverable" : ""}: lazy startup is shared and cancellation does not dispatch`, async (t) => {
+  test(`${kind}${essential ? " essential" : ""}: lazy startup is shared and cancellation does not dispatch`, async (t) => {
     const mcp = mockMcp(t);
     const discoveryStarted = deferred();
     const discovery = deferred();
@@ -108,7 +108,7 @@ for (const [kind, discoverable] of [
       await discovery.promise;
       return { tools: [] };
     });
-    const host = createHost(kind, discoverable);
+    const host = createHost(kind, essential);
     t.after(() => host.shutdown());
     assert.equal(host.start(), undefined);
     await new Promise<void>((done) => setImmediate(done));
@@ -118,7 +118,7 @@ for (const [kind, discoverable] of [
     if (kind === "omp") {
       assert.equal(
         host.tools.get("ida_reference")?.loadMode,
-        discoverable ? "discoverable" : "essential",
+        essential ? "essential" : "discoverable",
       );
     }
 
